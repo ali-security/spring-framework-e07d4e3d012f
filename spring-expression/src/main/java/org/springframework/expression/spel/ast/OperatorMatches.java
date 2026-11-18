@@ -16,7 +16,9 @@
 
 package org.springframework.expression.spel.ast;
 
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -41,11 +43,16 @@ import org.springframework.expression.spel.support.BooleanTypedValue;
 public class OperatorMatches extends Operator {
 
 	/**
+	 * Maximum number of compiled regular expressions in the pattern cache: {@value}.
+	 */
+	public static final int MAX_PATTERN_CACHE_SIZE = 256;
+
+	/**
 	 * Maximum number of characters permitted in a regular expression.
 	 */
 	private static final int MAX_REGEX_LENGTH = 1000;
 
-	private final ConcurrentMap<String, Pattern> patternCache;
+	private final PatternCache patternCache;
 
 
 	/**
@@ -54,13 +61,20 @@ public class OperatorMatches extends Operator {
 	 * with a shared pattern cache instead.
 	 */
 	public OperatorMatches(int pos, SpelNodeImpl... operands) {
-		this(new ConcurrentHashMap<String, Pattern>(), pos, operands);
+		this(new PatternCache(MAX_PATTERN_CACHE_SIZE), pos, operands);
 	}
 
 	/**
 	 * Create a new {@link OperatorMatches} instance with a shared pattern cache.
+	 * <p>The supplied {@code patternCacheMap} is ignored: the operator always compiles
+	 * through its own pattern cache, bounded to {@value #MAX_PATTERN_CACHE_SIZE}
+	 * entries, so that an unbounded shared map cannot be grown without limit.
 	 */
-	public OperatorMatches(ConcurrentMap<String, Pattern> patternCache, int pos, SpelNodeImpl... operands) {
+	public OperatorMatches(ConcurrentMap<String, Pattern> patternCacheMap, int pos, SpelNodeImpl... operands) {
+		this(new PatternCache(MAX_PATTERN_CACHE_SIZE), pos, operands);
+	}
+
+	private OperatorMatches(PatternCache patternCache, int pos, SpelNodeImpl... operands) {
 		super("matches", pos, operands);
 		this.patternCache = patternCache;
 	}
@@ -89,17 +103,16 @@ public class OperatorMatches extends Operator {
 			throw new SpelEvaluationException(rightOp.getStartPosition(),
 					SpelMessage.INVALID_SECOND_OPERAND_FOR_MATCHES_OPERATOR, right);
 		}
+		String rightString = (String) right;
+		if (rightString.length() > MAX_REGEX_LENGTH) {
+			throw new SpelEvaluationException(getStartPosition(),
+					SpelMessage.MAX_REGEX_LENGTH_EXCEEDED, MAX_REGEX_LENGTH);
+		}
 
 		state.trackOperation();
 		try {
 			String leftString = (String) left;
-			String rightString = (String) right;
 			Pattern pattern = this.patternCache.get(rightString);
-			if (pattern == null) {
-				checkRegexLength(rightString);
-				pattern = Pattern.compile(rightString);
-				this.patternCache.putIfAbsent(rightString, pattern);
-			}
 			Matcher matcher = pattern.matcher(leftString);
 			return BooleanTypedValue.forValue(matcher.matches());
 		}
@@ -108,10 +121,51 @@ public class OperatorMatches extends Operator {
 		}
 	}
 
-	private void checkRegexLength(String regex) {
-		if (regex.length() > MAX_REGEX_LENGTH) {
-			throw new SpelEvaluationException(getStartPosition(),
-					SpelMessage.MAX_REGEX_LENGTH_EXCEEDED, MAX_REGEX_LENGTH);
+
+	/**
+	 * Thread-safe cache of compiled regular expressions, bounded to a maximum
+	 * number of entries and evicting the least recently used pattern first.
+	 * <p>Patterns that fail to compile are never cached: the corresponding
+	 * {@link PatternSyntaxException} is propagated to the caller.
+	 */
+	private static class PatternCache {
+
+		private final int sizeLimit;
+
+		// Access-ordered: iteration starts with the least recently used entry
+		private final Map<String, Pattern> cache = new LinkedHashMap<String, Pattern>(16, 0.75f, true);
+
+		PatternCache(int sizeLimit) {
+			this.sizeLimit = sizeLimit;
+		}
+
+		public Pattern get(String regex) {
+			synchronized (this.cache) {
+				Pattern pattern = this.cache.get(regex);
+				if (pattern != null) {
+					return pattern;
+				}
+			}
+			Pattern pattern = Pattern.compile(regex);
+			synchronized (this.cache) {
+				this.cache.put(regex, pattern);
+				Iterator<String> keys = this.cache.keySet().iterator();
+				while (this.cache.size() > this.sizeLimit && keys.hasNext()) {
+					keys.next();
+					keys.remove();
+				}
+			}
+			return pattern;
+		}
+
+		public int size() {
+			synchronized (this.cache) {
+				return this.cache.size();
+			}
+		}
+
+		public int sizeLimit() {
+			return this.sizeLimit;
 		}
 	}
 
